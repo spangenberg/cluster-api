@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io/ioutil"
 
+	"github.com/enxebre/cluster-api-provider-aws"
 	"github.com/ghodss/yaml"
 	"github.com/golang/glog"
 	"github.com/spf13/cobra"
@@ -156,6 +157,8 @@ func parseMachinesYaml(file string) ([]*clusterv1.Machine, error) {
 
 func getProvider(provider string) (clusterdeployer.ProviderDeployer, error) {
 	switch provider {
+	case "aws":
+		return aws.NewActuator(nil, nil, nil, "us-east-1c"), nil
 	case "google":
 		return google.NewMachineActuator(google.MachineActuatorParams{})
 	case "vsphere":
