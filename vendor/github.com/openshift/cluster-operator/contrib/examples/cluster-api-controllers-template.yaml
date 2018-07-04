@@ -1,0 +1,134 @@
+apiVersion: v1
+kind: Template
+metadata:
+  name: cluster-operator-deploy-cluster-api-template
+
+objects:
+- apiVersion: v1
+  kind: ServiceAccount
+  metadata:
+    name: cluster-api-controller-manager
+    namespace: ${CLUSTER_API_NAMESPACE}
+
+- kind: DeploymentConfig
+  apiVersion: apps.openshift.io/v1
+  metadata:
+    name: aws-machine-controller
+    namespace: ${CLUSTER_API_NAMESPACE}
+    labels:
+      app: aws-machine-controller
+  spec:
+    selector:
+      app: aws-machine-controller
+    triggers:
+      - type: "ConfigChange"
+      - type: "ImageChange"
+        imageChangeParams:
+          automatic: true
+          containerNames:
+            - "machine-controller"
+          from:
+            # Uses the same ImageStream as our main controllers:
+            kind: "ImageStreamTag"
+            name: "${MACHINE_CONTROLLER_IMAGESTREAM}:latest"
+    replicas: 1
+    revisionHistoryLimit: 4
+    template:
+      metadata:
+        labels:
+          app: aws-machine-controller
+      spec:
+        serviceAccountName: cluster-api-controller-manager
+        containers:
+        - name: machine-controller
+          image: " "
+          imagePullPolicy: ${IMAGE_PULL_POLICY}
+          command:
+          - ${MACHINE_CONTROLLER_ENTRYPOINT}
+          args:
+          - --log-level=debug
+          - --default-availability-zone=${DEFAULT_AVAILABILITY_ZONE}
+          - --incluster=false
+          volumeMounts:
+          - name: bootstrap-kubeconfig
+            mountPath: /etc/origin/master
+            readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 20Mi
+            limits:
+              cpu: 100m
+              memory: 30Mi
+        dnsPolicy: ClusterFirst
+        restartPolicy: Always
+        securityContext: {}
+        terminationGracePeriodSeconds: 30
+        volumes:
+        - name: bootstrap-kubeconfig
+          secret:
+            secretName: bootstrap-kubeconfig
+
+- apiVersion: apps/v1beta1
+  kind: Deployment
+  metadata:
+    name: cluster-api-controller-manager
+    namespace: ${CLUSTER_API_NAMESPACE}
+    labels:
+      app: cluster-api-controller-manager
+  spec:
+    selector:
+      matchLabels:
+        app: cluster-api-controller-manager
+    replicas: 1
+    template:
+      metadata:
+        labels:
+          app: cluster-api-controller-manager
+      spec:
+        serviceAccountName: cluster-api-controller-manager
+        containers:
+        - name: controller-manager
+          image: ${CLUSTER_API_IMAGE}
+          imagePullPolicy: ${IMAGE_PULL_POLICY}
+          command:
+          - "./controller-manager"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 20Mi
+            limits:
+              cpu: 100m
+              memory: 30Mi
+        dnsPolicy: ClusterFirst
+        restartPolicy: Always
+        securityContext: {}
+        terminationGracePeriodSeconds: 30
+
+- apiVersion: v1
+  kind: Secret
+  type: Opaque
+  metadata:
+    name: bootstrap-kubeconfig
+    namespace: ${CLUSTER_API_NAMESPACE}
+  data:
+    bootstrap.kubeconfig: "${BOOTSTRAP_KUBECONFIG}"
+
+parameters:
+- name: CLUSTER_API_NAMESPACE
+  value: openshift-cluster-operator
+# location of cluster-api container image
+- name: CLUSTER_API_IMAGE
+  value: registry.svc.ci.openshift.org/openshift-cluster-operator/kubernetes-cluster-api:latest
+# machine controller image
+- name: DEFAULT_AVAILABILITY_ZONE
+  value: us-east-1c
+# pull policy (for testing)
+- name: IMAGE_PULL_POLICY
+  value: Always
+- name: BOOTSTRAP_KUBECONFIG
+  value: ""
+- name: MACHINE_CONTROLLER_IMAGESTREAM
+  value: cluster-operator
+- name: MACHINE_CONTROLLER_ENTRYPOINT
+  value: /opt/services/aws-machine-controller

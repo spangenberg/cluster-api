@@ -1,0 +1,579 @@
+/*
+Copyright 2018 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controller
+
+import (
+	"fmt"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/golang/mock/gomock"
+	log "github.com/sirupsen/logrus"
+	testlog "github.com/sirupsen/logrus/hooks/test"
+	"github.com/stretchr/testify/assert"
+
+	kbatch "k8s.io/api/batch/v1"
+	kapi "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	kruntime "k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	kubeinformers "k8s.io/client-go/informers"
+	clientgofake "k8s.io/client-go/kubernetes/fake"
+	clientgotesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/cache"
+
+	clusteroperator "github.com/openshift/cluster-operator/pkg/apis/clusteroperator/v1alpha1"
+	"github.com/openshift/cluster-operator/test"
+)
+
+const (
+	testJobPrefix = "test-job"
+	testOwnerKey  = "test-owner-key"
+)
+
+var (
+	testOwnerKind = schema.FromAPIVersionAndKind("test-api", "test-kind")
+)
+
+type testJobOwnerControl struct {
+	getOwnerKey func(owner metav1.Object) (string, error)
+
+	getOwner func(namespace string, name string) (metav1.Object, error)
+
+	onOwnedJobEvent func(owner metav1.Object)
+}
+
+func (c *testJobOwnerControl) GetOwnerKey(owner metav1.Object) (string, error) {
+	if c.getOwnerKey != nil {
+		return c.getOwnerKey(owner)
+	}
+	return KeyFunc(owner)
+}
+
+func (c *testJobOwnerControl) GetOwner(namespace string, name string) (metav1.Object, error) {
+	if c.getOwner != nil {
+		return c.getOwner(namespace, name)
+	}
+	return nil, fmt.Errorf("not found")
+}
+
+func (c *testJobOwnerControl) OnOwnedJobEvent(owner metav1.Object) {
+	if c.onOwnedJobEvent != nil {
+		c.onOwnedJobEvent(owner)
+		return
+	}
+	// Do nothing
+}
+
+func newTestJobControl(jobPrefix string, ownerKind schema.GroupVersionKind) (
+	*jobControl,
+	cache.Store, // job store
+	*clientgofake.Clientset,
+	kubeinformers.SharedInformerFactory,
+	*testJobOwnerControl,
+	log.FieldLogger,
+	*testlog.Hook,
+) {
+	kubeClient := &clientgofake.Clientset{}
+	kubeInformers := kubeinformers.NewSharedInformerFactory(kubeClient, 0)
+
+	// Ensure that the return from creating a job is the job created, since
+	// jobControl.createJob uses the returned job.
+	kubeClient.AddReactor("create", "jobs", func(action clientgotesting.Action) (bool, kruntime.Object, error) {
+		return true, action.(clientgotesting.CreateAction).GetObject(), nil
+	})
+
+	jobOwnerControl := &testJobOwnerControl{}
+
+	logger, hook := test.Logger()
+
+	c := NewJobControl(
+		jobPrefix,
+		ownerKind,
+		kubeClient,
+		kubeInformers.Batch().V1().Jobs().Lister(),
+		jobOwnerControl,
+		logger,
+	)
+
+	return c.(*jobControl),
+		kubeInformers.Batch().V1().Jobs().Informer().GetStore(),
+		kubeClient,
+		kubeInformers,
+		jobOwnerControl,
+		logger,
+		hook
+}
+
+func newTestOwner(generation int64) metav1.Object {
+	return &metav1.ObjectMeta{
+		Name:       "test-owner",
+		Generation: generation,
+	}
+}
+
+func newTestJob(name string) *kbatch.Job {
+	return &kbatch.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name,
+		},
+	}
+}
+
+func newTestControlledJob(namePrefix, nameEnding string, owner metav1.Object, ownerKind schema.GroupVersionKind, generation int64) *kbatch.Job {
+	return &kbatch.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            namePrefix + nameEnding,
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(owner, ownerKind)},
+			Annotations:     map[string]string{clusteroperator.OwnerGenerationAnnotation: strconv.FormatInt(generation, 10)},
+		},
+	}
+}
+
+func newTestControlledSuccessfulJob(namePrefix, nameEnding string, owner metav1.Object, ownerKind schema.GroupVersionKind, generation int64, completionTime time.Time) *kbatch.Job {
+	tempTime := metav1.Time{Time: completionTime}
+	return &kbatch.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            namePrefix + nameEnding,
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(owner, ownerKind)},
+			Annotations:     map[string]string{clusteroperator.OwnerGenerationAnnotation: strconv.FormatInt(generation, 10)},
+		},
+		Status: kbatch.JobStatus{
+			CompletionTime: &tempTime,
+			Conditions: []kbatch.JobCondition{
+				{
+					Type:   kbatch.JobComplete,
+					Status: kapi.ConditionTrue,
+				},
+			},
+		},
+	}
+}
+
+func newTestConfigMap(name string) *kapi.ConfigMap {
+	return &kapi.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name,
+		},
+	}
+}
+
+// TestJobControlWithoutNeedForNewJob tests controlling jobs when a new job
+// is not needed.
+func TestJobControlWithoutNeedForNewJob(t *testing.T) {
+	jobControl, _, _, _, _, _, loggerHook := newTestJobControl(testJobPrefix, testOwnerKind)
+	testOwner := newTestOwner(1)
+	result, job, err := jobControl.ControlJobs(testOwnerKey, testOwner, "", false, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("no error expected: %v", err)
+	}
+	if e, a := JobControlNoWork, result; e != a {
+		t.Fatalf("unexpected job control result: expected %v, got %v", e, a)
+	}
+	if job != nil {
+		t.Fatalf("no job expected: %v", job)
+	}
+	assert.Empty(t, test.GetDireLogEntries(loggerHook), "unexpected dire log entries")
+}
+
+// TestJobControlSuccessButOwnerNeedsReprocessing tests controlling jobs when a new job
+// was successful, but the job sync strategy has requested the owner be reprocessed:
+func TestJobControlSuccessButOwnerNeedsReprocessing(t *testing.T) {
+	cases := []struct {
+		name              string
+		lastSuccess       time.Time
+		reprocessInterval time.Duration
+		result            JobControlResult
+		jobExpected       bool
+	}{
+		{
+			name:              "no last success time",
+			lastSuccess:       time.Now().Add(-10 * time.Minute),
+			reprocessInterval: 2 * time.Minute,
+			result:            JobControlCreatingJob,
+			jobExpected:       false,
+		},
+		{
+			name:              "no reprocess required",
+			lastSuccess:       time.Now().Add(-10 * time.Minute),
+			reprocessInterval: 2 * time.Hour,
+			result:            JobControlJobSucceeded,
+			jobExpected:       true,
+		},
+		{
+			name:              "reprocess required",
+			lastSuccess:       time.Now().Add(-10 * time.Hour),
+			reprocessInterval: 2 * time.Hour,
+			result:            JobControlCreatingJob,
+			jobExpected:       false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mockCtrl := gomock.NewController(t)
+			defer mockCtrl.Finish()
+
+			jobControl, jobStore, _, _, _, _, loggerHook := newTestJobControl(testJobPrefix, testOwnerKind)
+
+			testOwner := newTestOwner(1)
+			existingJob := newTestControlledSuccessfulJob(testJobPrefix, "existing-job", testOwner,
+				testOwnerKind, 1, tc.lastSuccess)
+			jobStore.Add(existingJob)
+			newJob := newTestJob("new-job")
+			newConfigMap := newTestConfigMap("new-configmap")
+			jobFactory := NewMockJobFactory(mockCtrl)
+			if !tc.jobExpected {
+				jobFactory.EXPECT().BuildJob(prefixMatcher{"test-job-test-owner-"}).
+					Return(newJob.DeepCopy(), newConfigMap.DeepCopy(), nil)
+			}
+
+			result, job, err := jobControl.ControlJobs(testOwnerKey, testOwner, "", false,
+				&tc.reprocessInterval, &tc.lastSuccess, jobFactory)
+			if err != nil {
+				t.Fatalf("no error expected: %v", err)
+			}
+			if e, a := tc.result, result; e != a {
+				t.Fatalf("unexpected job control result: expected %v, got %v", e, a)
+			}
+			if tc.jobExpected && job == nil {
+				t.Fatalf("job expected: %v", job)
+			} else if !tc.jobExpected && job != nil {
+				t.Fatalf("no job expected: %v", job)
+			}
+			assert.Empty(t, test.GetDireLogEntries(loggerHook), "unexpected dire log entries")
+		})
+	}
+}
+
+// TestJobControlWithPendingExpectations tests controlling jobs when there
+// are pending expectations that have not yet been met.
+func TestJobControlWithPendingExpectations(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	jobControl, _, _, _, _, _, loggerHook := newTestJobControl(testJobPrefix, testOwnerKind)
+	testOwner := newTestOwner(1)
+	jobControl.expectations.ExpectCreations(testOwnerKey, 1)
+	jobFactory := NewMockJobFactory(mockCtrl)
+	result, job, err := jobControl.ControlJobs(testOwnerKey, testOwner, "", true, nil, nil, jobFactory)
+	if err != nil {
+		t.Fatalf("no error expected: %v", err)
+	}
+	if e, a := JobControlPendingExpectations, result; e != a {
+		t.Fatalf("unexpected job control result: expected %v, got %v", e, a)
+	}
+	if job != nil {
+		t.Fatalf("no job expected: %v", job)
+	}
+	assert.Empty(t, test.GetDireLogEntries(loggerHook), "unexpected dire log entries")
+}
+
+// TestJobControlForNewJob tests controlling jobs when there are no existing
+// jobs and a new job is needed.
+func TestJobControlForNewJob(t *testing.T) {
+	cases := []struct {
+		name               string
+		extraJobIdentifier string
+	}{
+		{
+			name:               "no extra",
+			extraJobIdentifier: "",
+		},
+		{
+			name:               "extra",
+			extraJobIdentifier: "extra",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mockCtrl := gomock.NewController(t)
+			defer mockCtrl.Finish()
+
+			jobControl, _, kubeClient, _, _, _, loggerHook := newTestJobControl(testJobPrefix, testOwnerKind)
+			testOwner := newTestOwner(1)
+			newJob := newTestJob("new-job")
+			newConfigMap := newTestConfigMap("new-configmap")
+			jobFactory := NewMockJobFactory(mockCtrl)
+			expectedJobNamePrefix := "test-job-test-owner"
+			if tc.extraJobIdentifier != "" {
+				expectedJobNamePrefix = fmt.Sprintf("test-job-%s-test-owner", tc.extraJobIdentifier)
+			}
+			jobFactory.EXPECT().BuildJob(prefixMatcher{expectedJobNamePrefix}).
+				Return(newJob.DeepCopy(), newConfigMap.DeepCopy(), nil)
+			result, job, err := jobControl.ControlJobs(testOwnerKey, testOwner, tc.extraJobIdentifier, true, nil, nil, jobFactory)
+			if err != nil {
+				t.Fatalf("no error expected: %v", err)
+			}
+			if e, a := JobControlCreatingJob, result; e != a {
+				t.Fatalf("unexpected job control result: expected %v, got %v", e, a)
+			}
+			if job != nil {
+				t.Fatalf("no job expected: %v", job)
+			}
+			actions := kubeClient.Actions()
+			if e, a := 2, len(actions); e != a {
+				t.Fatalf("unexpected number of kube client actions: expected %v, got %v", e, a)
+			}
+			{
+				createAction, ok := actions[0].(clientgotesting.CreateAction)
+				if !ok {
+					t.Fatalf("first action was not a create: %v", actions[0])
+				}
+				createdObject := createAction.GetObject()
+				configMap, ok := createdObject.(*kapi.ConfigMap)
+				if !ok {
+					t.Fatalf("first action created object is not a configmap")
+				}
+				if e, a := newConfigMap.Name, configMap.Name; e != a {
+					t.Fatalf("created configmap does not match expected: expected %v, got %v", e, a)
+				}
+			}
+			{
+				createAction, ok := actions[1].(clientgotesting.CreateAction)
+				if !ok {
+					t.Fatalf("second action was not a create: %v", actions[0])
+				}
+				createdObject := createAction.GetObject()
+				createdJob, ok := createdObject.(*kbatch.Job)
+				if !ok {
+					t.Fatalf("second action created object is not a job")
+				}
+				if e, a := newJob.Name, createdJob.Name; e != a {
+					t.Fatalf("created job does not match expected: expected %v, got %v", e, a)
+				}
+			}
+			assert.Empty(t, test.GetDireLogEntries(loggerHook), "unexpected dire log entries")
+		})
+	}
+}
+
+// TestJobControlWhenJobDeleteFails tests controlling jobs when the delete
+// of an old existing job fails.
+func TestJobControlWhenJobDeleteFails(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	jobControl, jobStore, kubeClient, _, _, _, loggerHook := newTestJobControl(testJobPrefix, testOwnerKind)
+	kubeClient.AddReactor("delete", "jobs", func(action clientgotesting.Action) (bool, kruntime.Object, error) {
+		return true, nil, fmt.Errorf("delete failed")
+	})
+	testOwner := newTestOwner(2)
+	existingJob := newTestControlledJob(testJobPrefix, "existing-job", testOwner, testOwnerKind, 1)
+	jobStore.Add(existingJob)
+	jobFactory := NewMockJobFactory(mockCtrl)
+	result, _, err := jobControl.ControlJobs(testOwnerKey, testOwner, "", true, nil, nil, jobFactory)
+	if err == nil {
+		t.Fatalf("error expected")
+	}
+	if e, a := JobControlDeletingJobs, result; e != a {
+		t.Fatalf("unexpected job control result: expected %v, got %v", e, a)
+	}
+	if e, a := "delete failed", err.Error(); e != a {
+		t.Fatalf("unexpected error: expected %v, got %v", e, a)
+	}
+	assert.Empty(t, test.GetDireLogEntries(loggerHook), "unexpected dire log entries")
+}
+
+// TestJobControlWhenControlledJobAdded tests adding a job that is controlled
+// by the job control.
+func TestJobControlWhenControlledJobAdded(t *testing.T) {
+	jobControl, _, _, _, jobOwnerControl, _, loggerHook := newTestJobControl(testJobPrefix, testOwnerKind)
+	testOwner := newTestOwner(1)
+	jobOwnerControl.getOwner = func(namespace string, name string) (metav1.Object, error) {
+		return testOwner, nil
+	}
+	ownerEnqueued := false
+	jobOwnerControl.onOwnedJobEvent = func(owner metav1.Object) {
+		assert.Equal(t, testOwner, owner, "unexpected enqueued owner")
+		ownerEnqueued = true
+	}
+	newJob := newTestControlledJob(testJobPrefix, "new-job", testOwner, testOwnerKind, 1)
+	jobControl.OnAdd(newJob)
+	assert.True(t, ownerEnqueued, "owner not enqueued")
+	assert.Empty(t, test.GetDireLogEntries(loggerHook), "unexpected dire log entries")
+}
+
+// TestJobControlWhenUncontrolledJobAdded tests adding a job that is not
+// controlled by the job control.
+func TestJobControlWhenUncontrolledJobAdded(t *testing.T) {
+	jobControl, _, _, _, jobOwnerControl, _, loggerHook := newTestJobControl(testJobPrefix, testOwnerKind)
+	testOwner := newTestOwner(1)
+	jobOwnerControl.getOwner = func(namespace string, name string) (metav1.Object, error) {
+		return testOwner, nil
+	}
+	ownerEnqueued := false
+	jobOwnerControl.onOwnedJobEvent = func(owner metav1.Object) {
+		assert.Equal(t, testOwner, owner, "unexpected enqueued owner")
+		ownerEnqueued = true
+	}
+	newJob := newTestJob("new-job")
+	jobControl.OnAdd(newJob)
+	assert.False(t, ownerEnqueued, "owner enqueued unexpectedly")
+	assert.Empty(t, test.GetDireLogEntries(loggerHook), "unexpected dire log entries")
+}
+
+// TestJobControlWhenControlledJobAddedWithMissingOwner tests adding a job
+// that is controlled by the job control but whose owner is missing.
+func TestJobControlWhenControlledJobAddedWithMissingOwner(t *testing.T) {
+	jobControl, _, _, _, jobOwnerControl, _, loggerHook := newTestJobControl(testJobPrefix, testOwnerKind)
+	testOwner := newTestOwner(1)
+	jobOwnerControl.getOwner = func(namespace string, name string) (metav1.Object, error) {
+		return nil, nil
+	}
+	ownerEnqueued := false
+	jobOwnerControl.onOwnedJobEvent = func(owner metav1.Object) {
+		assert.Equal(t, testOwner, owner, "unexpected enqueued owner")
+		ownerEnqueued = true
+	}
+	newJob := newTestControlledJob(testJobPrefix, "new-job", testOwner, testOwnerKind, 1)
+	jobControl.OnAdd(newJob)
+	assert.False(t, ownerEnqueued, "owner enqueued unexpectedly")
+	assert.NotEmpty(t, test.GetDireLogEntries(loggerHook), "expected dire log entries")
+}
+
+// TestJobControlWhenControlledJobUpdated tests updating a job that is
+// controlled by the job control.
+func TestJobControlWhenControlledJobUpdated(t *testing.T) {
+	jobControl, _, _, _, jobOwnerControl, _, loggerHook := newTestJobControl(testJobPrefix, testOwnerKind)
+	testOwner := newTestOwner(1)
+	jobOwnerControl.getOwner = func(namespace string, name string) (metav1.Object, error) {
+		return testOwner, nil
+	}
+	ownerEnqueued := false
+	jobOwnerControl.onOwnedJobEvent = func(owner metav1.Object) {
+		assert.Equal(t, testOwner, owner, "unexpected enqueued owner")
+		ownerEnqueued = true
+	}
+	newJob := newTestControlledJob(testJobPrefix, "new-job", testOwner, testOwnerKind, 1)
+	jobControl.OnUpdate(newJob, newJob)
+	assert.True(t, ownerEnqueued, "owner not enqueued")
+	assert.Empty(t, test.GetDireLogEntries(loggerHook), "unexpected dire log entries")
+}
+
+// TestJobControlWhenUncontrolledJobUpdated tests updating a job that is not
+// controlled by the job control.
+func TestJobControlWhenUncontrolledJobUpdated(t *testing.T) {
+	jobControl, _, _, _, jobOwnerControl, _, loggerHook := newTestJobControl(testJobPrefix, testOwnerKind)
+	testOwner := newTestOwner(1)
+	jobOwnerControl.getOwner = func(namespace string, name string) (metav1.Object, error) {
+		return testOwner, nil
+	}
+	ownerEnqueued := false
+	jobOwnerControl.onOwnedJobEvent = func(owner metav1.Object) {
+		assert.Equal(t, testOwner, owner, "unexpected enqueued owner")
+		ownerEnqueued = true
+	}
+	newJob := newTestJob("new-job")
+	jobControl.OnUpdate(newJob, newJob)
+	assert.False(t, ownerEnqueued, "owner enqueued unexpectedly")
+	assert.Empty(t, test.GetDireLogEntries(loggerHook), "unexpected dire log entries")
+}
+
+// TestJobControlWhenControlledJobUpdatedWithMissingOwner tests updating a job
+// that is controlled by the job control but whose owner is missing.
+func TestJobControlWhenControlledJobUpdatedWithMissingOwner(t *testing.T) {
+	jobControl, _, _, _, jobOwnerControl, _, loggerHook := newTestJobControl(testJobPrefix, testOwnerKind)
+	testOwner := newTestOwner(1)
+	jobOwnerControl.getOwner = func(namespace string, name string) (metav1.Object, error) {
+		return nil, nil
+	}
+	ownerEnqueued := false
+	jobOwnerControl.onOwnedJobEvent = func(owner metav1.Object) {
+		assert.Equal(t, testOwner, owner, "unexpected enqueued owner")
+		ownerEnqueued = true
+	}
+	newJob := newTestControlledJob(testJobPrefix, "new-job", testOwner, testOwnerKind, 1)
+	jobControl.OnUpdate(newJob, newJob)
+	assert.False(t, ownerEnqueued, "owner enqueued unexpectedly")
+	assert.NotEmpty(t, test.GetDireLogEntries(loggerHook), "expected dire log entries")
+}
+
+// TestJobControlWhenControlledJobDeleted tests deleting a job that is
+// controlled by the job control.
+func TestJobControlWhenControlledJobDeleted(t *testing.T) {
+	jobControl, _, _, _, jobOwnerControl, _, loggerHook := newTestJobControl(testJobPrefix, testOwnerKind)
+	testOwner := newTestOwner(1)
+	jobOwnerControl.getOwner = func(namespace string, name string) (metav1.Object, error) {
+		return testOwner, nil
+	}
+	ownerEnqueued := false
+	jobOwnerControl.onOwnedJobEvent = func(owner metav1.Object) {
+		assert.Equal(t, testOwner, owner, "unexpected enqueued owner")
+		ownerEnqueued = true
+	}
+	newJob := newTestControlledJob(testJobPrefix, "new-job", testOwner, testOwnerKind, 1)
+	jobControl.OnDelete(newJob)
+	assert.True(t, ownerEnqueued, "owner not enqueued")
+	assert.Empty(t, test.GetDireLogEntries(loggerHook), "unexpected dire log entries")
+}
+
+// TestJobControlWhenUncontrolledJobDeleted tests deleting a job that is not
+// controlled by the job control.
+func TestJobControlWhenUncontrolledJobDeleted(t *testing.T) {
+	jobControl, _, _, _, jobOwnerControl, _, loggerHook := newTestJobControl(testJobPrefix, testOwnerKind)
+	testOwner := newTestOwner(1)
+	jobOwnerControl.getOwner = func(namespace string, name string) (metav1.Object, error) {
+		return testOwner, nil
+	}
+	ownerEnqueued := false
+	jobOwnerControl.onOwnedJobEvent = func(owner metav1.Object) {
+		assert.Equal(t, testOwner, owner, "unexpected enqueued owner")
+		ownerEnqueued = true
+	}
+	newJob := newTestJob("new-job")
+	jobControl.OnDelete(newJob)
+	assert.False(t, ownerEnqueued, "owner enqueued unexpectedly")
+	assert.Empty(t, test.GetDireLogEntries(loggerHook), "unexpected dire log entries")
+}
+
+// TestJobControlWhenControlledJobDeletedWithMissingOwner tests deleting a job
+// that is controlled by the job control but whose owner is missing.
+func TestJobControlWhenControlledJobDeletedWithMissingOwner(t *testing.T) {
+	jobControl, _, _, _, jobOwnerControl, _, loggerHook := newTestJobControl(testJobPrefix, testOwnerKind)
+	testOwner := newTestOwner(1)
+	jobOwnerControl.getOwner = func(namespace string, name string) (metav1.Object, error) {
+		return nil, nil
+	}
+	ownerEnqueued := false
+	jobOwnerControl.onOwnedJobEvent = func(owner metav1.Object) {
+		assert.Equal(t, testOwner, owner, "unexpected enqueued owner")
+		ownerEnqueued = true
+	}
+	newJob := newTestControlledJob(testJobPrefix, "new-job", testOwner, testOwnerKind, 1)
+	jobControl.OnDelete(newJob)
+	assert.False(t, ownerEnqueued, "owner enqueued unexpectedly")
+	assert.NotEmpty(t, test.GetDireLogEntries(loggerHook), "expected dire log entries")
+}
+
+type prefixMatcher struct {
+	prefix string
+}
+
+func (m prefixMatcher) Matches(x interface{}) bool {
+	switch s := x.(type) {
+	case string:
+		return strings.HasPrefix(s, m.prefix)
+	default:
+		return false
+	}
+}
+
+func (m prefixMatcher) String() string {
+	return fmt.Sprintf("prefix %q", m.prefix)
+}

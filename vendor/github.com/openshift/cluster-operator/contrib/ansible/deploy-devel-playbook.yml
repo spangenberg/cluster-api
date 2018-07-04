@@ -1,0 +1,131 @@
+#!/usr/bin/ansible-playbook
+#
+# Deploy Cluster Operator to a development cluster.
+#
+# Wraps the main deploy-playbook.yaml and adds additional performs additional
+# devel specific tasks.
+---
+
+- hosts: localhost
+  connection: local
+  gather_facts: no
+  tasks:
+  - name: set default variable values
+    set_fact:
+      # Namespace to deploy CO to:
+      cluster_operator_namespace: "{{ cluster_operator_namespace | default('openshift-cluster-operator') }}"
+
+      # Namespace for cluster versions:
+      cluster_version_namespace: "{{ cluster_version_namespace | default('openshift-cluster-operator') }}"
+
+      # Images to deploy on target cluster
+      cluster_api_image: "{{ cluster_api_image | default('registry.svc.ci.openshift.org/openshift-cluster-operator/kubernetes-cluster-api:latest') }}"
+      cluster_api_image_pull_policy: "{{ cluster_api_image_pull_policy | default('Always') }}"
+      machine_controller_image: "{{ machine_controller_image | default('registry.svc.ci.openshift.org/openshift-cluster-operator/cluster-operator:latest') }}"
+      machine_controller_image_pull_policy: "{{ machine_controller_image_pull_policy | default('Always') }}"
+
+      fake_deployment: "{{ fake_deployment | default(True) }}"
+      ansible_image: "{{ ansible_image | default('cluster-operator-ansible:canary') }}"
+      ansible_image_pull_policy: "{{ ansible_image_pull_policy | default('Never') }}"
+
+      # Normally we assume to build and push images for devel deployments:
+      build_images: "{{ build_images | default(True) }}"
+      push_images: "{{ push_images | default(True) }}"
+      process_cluster_versions: False
+
+# Perform a normal deployment:
+- import_playbook: deploy-playbook.yml
+
+
+- hosts: localhost
+  connection: local
+  gather_facts: no
+  tasks:
+  - name: set ansible image name
+    set_fact:
+      ansible_image: "fake-openshift-ansible:canary"
+    when: fake_deployment | bool
+
+  - name: build images off latest source
+    shell: make images
+    args:
+      chdir: "{{ playbook_dir }}/../../"
+    when: build_images | bool
+
+  - name: push devel images to integrated registry
+    command: make integrated-registry-push
+    args:
+      chdir: "{{ playbook_dir }}/../../"
+    when: push_images | bool
+
+  - name: wait for apiserver deployment to finish
+    command: |-
+      oc rollout status deploymentconfig/cluster-operator-apiserver -n {{ cluster_operator_namespace | quote }}
+
+  - name: wait for controller-manager deployment to finish
+    command: |-
+      oc rollout status deploymentconfig/cluster-operator-controller-manager -n {{ cluster_operator_namespace | quote }}
+
+  - import_role:
+      name: kubectl-ansible
+
+  - name: create/update playbook mock deployment
+    kubectl_apply:
+      namespace: "{{ cluster_operator_namespace }}"
+      src: "{{ playbook_dir }}/../examples/deploy-playbook-mock.yaml"
+
+  - name: check if cluster version already exists
+    command: "oc get clusterversion origin-v3-10 -n {{ cluster_operator_namespace }}"
+    failed_when: false
+    changed_when: false
+    ignore_errors: yes
+    register: cluster_version_exists_reg
+    retries: 5
+    until: cluster_version_exists_reg.stderr.find("ServiceUnavailable") == -1
+
+  - set_fact:
+      process_cluster_versions: True
+    when: cluster_version_exists_reg.rc > 0 and "NotFound" in cluster_version_exists_reg.stderr
+
+  - name: process cluster versions template
+    oc_process:
+      template_file: "{{ playbook_dir }}/../examples/cluster-versions-template.yaml"
+      parameters:
+        CLUSTER_VERSION_NS: "{{ cluster_version_namespace }}"
+        CLUSTER_API_IMAGE: "{{ cluster_api_image }}"
+        CLUSTER_API_IMAGE_PULL_POLICY: "{{ cluster_api_image_pull_policy }}"
+        MACHINE_CONTROLLER_IMAGE: "{{ machine_controller_image }}"
+        MACHINE_CONTROLLER_IMAGE_PULL_POLICY: "{{ machine_controller_image_pull_policy }}"
+        ANSIBLE_IMAGE: "{{ ansible_image }}"
+        ANSIBLE_IMAGE_PULL_POLICY: "{{ ansible_image_pull_policy }}"
+    register: cluster_versions_reg
+    when: process_cluster_versions
+
+  - name: create/update cluster versions
+    kubectl_apply:
+      definition: "{{ cluster_versions_reg.result | to_json }}"
+    # Even with waiting for the apiserver deployment, there are still a few seconds before the apiserver responds:
+    retries: 5
+    delay: 5
+    register: create_versions_result
+    until: create_versions_result is succeeded
+    ignore_errors: yes
+    when: process_cluster_versions
+
+  - debug: var=create_versions_result
+    when: process_cluster_versions and not create_versions_result is succeeded
+
+  - name: report error if unable to create cluster versions
+    fail:
+      msg: 'Unable to create cluster versions'
+    when: process_cluster_versions and not create_versions_result is succeeded
+
+  - name: describe deployment
+    debug:
+      msg: "WARNING: You have created a cluster operator deployment with fake images. Clusters will not be created on your cloud provider."
+    when: fake_deployment | bool
+
+  - name: describe deployment
+    debug:
+      msg: "WARNING: You have created a cluster operator deployment with real images. Creating a cluster will result in artifacts provisioned to your cloud provider."
+    when: not (fake_deployment | bool)

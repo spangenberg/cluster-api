@@ -49,6 +49,44 @@
   version = "v9"
 
 [[projects]]
+  name = "github.com/aws/aws-sdk-go"
+  packages = [
+    "aws",
+    "aws/awserr",
+    "aws/awsutil",
+    "aws/client",
+    "aws/client/metadata",
+    "aws/corehandlers",
+    "aws/credentials",
+    "aws/credentials/ec2rolecreds",
+    "aws/credentials/endpointcreds",
+    "aws/credentials/stscreds",
+    "aws/csm",
+    "aws/defaults",
+    "aws/ec2metadata",
+    "aws/endpoints",
+    "aws/request",
+    "aws/session",
+    "aws/signer/v4",
+    "internal/sdkio",
+    "internal/sdkrand",
+    "internal/shareddefaults",
+    "private/protocol",
+    "private/protocol/ec2query",
+    "private/protocol/query",
+    "private/protocol/query/queryutil",
+    "private/protocol/rest",
+    "private/protocol/xml/xmlutil",
+    "service/ec2",
+    "service/ec2/ec2iface",
+    "service/elb",
+    "service/elb/elbiface",
+    "service/sts"
+  ]
+  revision = "e4f914808a9655ef3220bb0082002239cc7f3561"
+  version = "v1.14.19"
+
+[[projects]]
   branch = "master"
   name = "github.com/beorn7/perks"
   packages = ["quantile"]
@@ -125,6 +163,12 @@
   version = "1.0.1"
 
 [[projects]]
+  branch = "master"
+  name = "github.com/enxebre/cluster-api-provider-aws"
+  packages = ["."]
+  revision = "2480da30efe4b8212d6724ed4bc75edf5e1bdaa6"
+
+[[projects]]
   name = "github.com/evanphx/json-patch"
   packages = ["."]
   revision = "afac545df32f2287a079e2dfb7ba2745a643747e"
@@ -135,6 +179,12 @@
   packages = ["."]
   revision = "0ca9ea5df5451ffdf184b4428c902747c2c11cd7"
   version = "v1.0.0"
+
+[[projects]]
+  name = "github.com/go-ini/ini"
+  packages = ["."]
+  revision = "06f5f3d67269ccec1fe5fe4134ba6e982984f7f5"
+  version = "v1.37.0"
 
 [[projects]]
   branch = "master"
@@ -298,6 +348,11 @@
   version = "v1.0"
 
 [[projects]]
+  name = "github.com/jmespath/go-jmespath"
+  packages = ["."]
+  revision = "0b12d6b5"
+
+[[projects]]
   name = "github.com/joho/godotenv"
   packages = ["."]
   revision = "a79fa1e548e2c689c241d10173efd51e5d689d5b"
@@ -386,6 +441,23 @@
   version = "v1.4.0"
 
 [[projects]]
+  branch = "master"
+  name = "github.com/openshift/cluster-operator"
+  packages = [
+    "pkg/api",
+    "pkg/apis/clusteroperator",
+    "pkg/apis/clusteroperator/install",
+    "pkg/apis/clusteroperator/v1alpha1",
+    "pkg/client/clientset_generated/clientset",
+    "pkg/client/clientset_generated/clientset/scheme",
+    "pkg/client/clientset_generated/clientset/typed/clusteroperator/v1alpha1",
+    "pkg/client/listers_generated/clusteroperator/v1alpha1",
+    "pkg/controller",
+    "pkg/logging"
+  ]
+  revision = "71d840351b9019b0103093c0856f422d00281251"
+
+[[projects]]
   name = "github.com/pborman/uuid"
   packages = ["."]
   revision = "e790cca94e6cc75c7064b1332e63811d4aae1a53"
@@ -441,6 +513,12 @@
     "xfs"
   ]
   revision = "780932d4fbbe0e69b84c34c20f5c8d0981e109ea"
+
+[[projects]]
+  name = "github.com/sirupsen/logrus"
+  packages = ["."]
+  revision = "c155da19408a8799da419ed3eeb0cb5db0ad5dbc"
+  version = "v1.0.5"
 
 [[projects]]
   name = "github.com/spf13/cobra"
@@ -979,6 +1057,7 @@
     "util/homedir",
     "util/integer",
     "util/jsonpath",
+    "util/retry",
     "util/workqueue"
   ]
   revision = "90539b4e75a8daaf7f67c3874c6180bfb1a63936"
@@ -1027,6 +1106,6 @@
 [solve-meta]
   analyzer-name = "dep"
   analyzer-version = 1
-  inputs-digest = "40cbed3bd870f59d6c28ecaaa706e5aab9d974a8b52a410e89442a1e522962c6"
+  inputs-digest = "2d2c49c4b1e203ad7d61427bc9f3cf57d3fdc1fb46407f040441f1f2e2fba1ae"
   solver-name = "gps-cdcl"
   solver-version = 1

@@ -1,0 +1,339 @@
+---
+########
+#
+# Template for deploying the Cluster Operator.
+#
+# NOTE: This template requires auth configuration from the cluster-operator-roles-template.yaml.
+#
+########
+
+apiVersion: v1
+kind: Template
+metadata:
+  name: cluster-operator-deploy-template
+  namespace: ${CLUSTER_OPERATOR_NAMESPACE}
+
+parameters:
+# Namespace to use for cluster-operator
+- name: CLUSTER_OPERATOR_NAMESPACE
+  value: openshift-cluster-operator
+# CA cert for API Server SSL cert
+- name: SERVING_CA
+# Namespace of kube-system. Do not change. Required due to oc process behavior.
+- name: KUBE_SYSTEM_NAMESPACE
+  value: kube-system
+- name: GIT_REPO
+  description: Cluster Operator git repository the BuildConfig will use.
+  value: https://github.com/openshift/cluster-operator
+- name: GIT_REF
+  description: Cluster Operator git repository branch/tag/commit the BuildConfig will use.
+  value: master
+objects:
+- kind: PersistentVolumeClaim
+  apiVersion: v1
+  metadata:
+    name: etcd-storage
+    namespace: ${CLUSTER_OPERATOR_NAMESPACE}
+  spec:
+    accessModes:
+      - ReadWriteOnce
+    volumeMode: Filesystem
+    resources:
+      requests:
+        storage: 1Gi
+
+- kind: ImageStream
+  apiVersion: image.openshift.io/v1
+  metadata:
+    name: cluster-operator
+    namespace: ${CLUSTER_OPERATOR_NAMESPACE}
+  spec: {}
+
+- kind: BuildConfig
+  apiVersion: build.openshift.io/v1
+  metadata:
+    name: cluster-operator
+    namespace: ${CLUSTER_OPERATOR_NAMESPACE}
+  spec:
+    source:
+      type: "Git"
+      git:
+        uri: ${GIT_REPO}
+        ref: ${GIT_REF}
+    strategy:
+      type: "Docker"
+      dockerStrategy:
+        from:
+          kind: DockerImage
+          name: golang:1.9
+        dockerfilePath:
+    output:
+      to:
+        kind: ImageStreamTag
+        name: cluster-operator:latest
+    triggers: []
+    nodeSelector: {}
+    successfulBuildsHistoryLimit: 3
+    failedBuildsHistoryLimit: 3
+  status:
+    lastVersion: 0
+
+# Deployment of the API Server pod
+- kind: DeploymentConfig
+  apiVersion: apps.openshift.io/v1
+  metadata:
+    name: cluster-operator-apiserver
+    namespace: ${CLUSTER_OPERATOR_NAMESPACE}
+    labels:
+      app: cluster-operator-apiserver
+  spec:
+    selector:
+      app: cluster-operator-apiserver
+    replicas: 1
+    revisionHistoryLimit: 4
+    # NOTE: can't do Rolling here yet, the new etcd container can't come up due to a lock on the snap/db
+    # in the persistent volume which is held by the running deployment.
+    strategy:
+      type: Recreate
+    triggers:
+      - type: "ConfigChange"
+      - type: "ImageChange"
+        imageChangeParams:
+          automatic: true
+          containerNames:
+            - "apiserver"
+          from:
+            kind: "ImageStreamTag"
+            name: "cluster-operator:latest"
+    template:
+      metadata:
+        labels:
+          app: cluster-operator-apiserver
+      spec:
+        serviceAccountName: cluster-operator-apiserver
+        containers:
+        - name: apiserver
+          args:
+          - apiserver
+          - --secure-port
+          - "6443"
+          - --etcd-servers
+          - http://localhost:2379
+          - -v
+          - "10"
+          image: cluster-operator:latest
+          name: apiserver
+          ports:
+          - containerPort: 6443
+            protocol: TCP
+          terminationMessagePath: /dev/termination-log
+          volumeMounts:
+          - mountPath: /var/run/openshift-cluster-operator
+            name: apiserver-ssl
+            readOnly: true
+          readinessProbe:
+            httpGet:
+              port: 6443
+              path: /healthz
+              scheme: HTTPS
+            failureThreshold: 1
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet:
+              port: 6443
+              path: /healthz
+              scheme: HTTPS
+            failureThreshold: 3
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 2
+        - name: etcd
+          # TODO: fixed tag here?
+          image: quay.io/coreos/etcd:latest
+          imagePullPolicy: Always
+          resources:
+            requests:
+              cpu: 100m
+              memory: 20Mi
+            limits:
+              cpu: 100m
+              memory: 30Mi
+          env:
+          - name: ETCD_DATA_DIR
+            value: /etcd-data-dir
+          command:
+          - /usr/local/bin/etcd
+          - --listen-client-urls
+          - http://0.0.0.0:2379
+          - --advertise-client-urls
+          - http://localhost:2379
+          ports:
+          - containerPort: 2379
+          volumeMounts:
+          - name: etcd-data-dir
+            mountPath: /etcd-data-dir
+          readinessProbe:
+            httpGet:
+              port: 2379
+              path: /health
+            failureThreshold: 1
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet:
+              port: 2379
+              path: /health
+            failureThreshold: 3
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 2
+        dnsPolicy: ClusterFirst
+        restartPolicy: Always
+        terminationGracePeriodSeconds: 30
+        volumes:
+        - name: apiserver-ssl
+          secret:
+            defaultMode: 420
+            secretName: cluster-operator-apiserver-cert
+            items:
+            - key: tls.crt
+              path: apiserver.crt
+            - key: tls.key
+              path: apiserver.key
+        - name: etcd-data-dir
+          persistentVolumeClaim:
+            claimName: etcd-storage
+
+# Deployment of the Controller Manager pod
+- kind: DeploymentConfig
+  apiVersion: apps.openshift.io/v1
+  metadata:
+    name: cluster-operator-controller-manager
+    namespace: ${CLUSTER_OPERATOR_NAMESPACE}
+    labels:
+      app: cluster-operator-controller-manager
+  spec:
+    selector:
+      app: cluster-operator-controller-manager
+    triggers:
+      - type: "ConfigChange"
+      - type: "ImageChange"
+        imageChangeParams:
+          automatic: true
+          containerNames:
+            - "controller-manager"
+          from:
+            kind: "ImageStreamTag"
+            name: "cluster-operator:latest"
+    replicas: 1
+    revisionHistoryLimit: 4
+    template:
+      metadata:
+        labels:
+          app: cluster-operator-controller-manager
+      spec:
+        serviceAccountName: cluster-operator-controller-manager
+        containers:
+        - name: controller-manager
+          image: cluster-operator:latest
+          resources:
+            requests:
+              cpu: 100m
+              memory: 20Mi
+            limits:
+              cpu: 100m
+              memory: 30Mi
+          args:
+          - controller-manager
+          - --port
+          - "8080"
+          - --leader-election-namespace
+          - ${CLUSTER_OPERATOR_NAMESPACE}
+          - --leader-elect-resource-lock
+          - "configmaps"
+          - --profiling
+          - "false"
+          - --contention-profiling
+          - "false"
+          - -v
+          - "1"
+          - --log-level
+          - "debug"
+          ports:
+          - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              port: 8080
+              path: /healthz
+            failureThreshold: 1
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet:
+              port: 8080
+              path: /healthz
+            failureThreshold: 3
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 2
+
+# Service for the API Server
+- kind: Service
+  apiVersion: v1
+  metadata:
+    name: cluster-operator-apiserver
+    namespace: ${CLUSTER_OPERATOR_NAMESPACE}
+    labels:
+      app: cluster-operator-apiserver
+  spec:
+    type: NodePort
+    selector:
+      app: cluster-operator-apiserver
+    ports:
+    - name: secure
+      protocol: TCP
+      port: 443
+      targetPort: 6443
+      nodePort: 30443
+
+# Registration of the cluster-operator API with the aggregator
+- apiVersion: apiregistration.k8s.io/v1beta1
+  kind: APIService
+  metadata:
+    name: v1alpha1.clusteroperator.openshift.io
+    namespace: ${KUBE_SYSTEM_NAMESPACE}
+  spec:
+    group: clusteroperator.openshift.io
+    version: v1alpha1
+    service:
+      namespace: ${CLUSTER_OPERATOR_NAMESPACE}
+      name: cluster-operator-apiserver
+    caBundle: ${SERVING_CA}
+    groupPriorityMinimum: 10000
+    versionPriority: 20
+
+# Registration of the cluster-api API with the aggregator
+- apiVersion: apiregistration.k8s.io/v1beta1
+  kind: APIService
+  metadata:
+    name: v1alpha1.cluster.k8s.io
+    namespace: ${KUBE_SYSTEM_NAMESPACE}
+  spec:
+    group: cluster.k8s.io
+    version: v1alpha1
+    service:
+      namespace: ${CLUSTER_OPERATOR_NAMESPACE}
+      name: cluster-operator-apiserver
+    caBundle: ${SERVING_CA}
+    groupPriorityMinimum: 10000
+    versionPriority: 20
